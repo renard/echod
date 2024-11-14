@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+
+# Copyright © 2024 Sébastien Gross
+#
+# Created: 2024-11-14 11:22:15
+# Last changed: 2024-11-14 14:59:44
+#
+# This program is free software: you can redistribute it and/or
+# modify it under the terms of the GNU Affero General Public License
+# as published by the Free Software Foundation, either version 3 of
+# the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public
+# License along with this program. If not, see
+# <http://www.gnu.org/licenses/>.
+
+
+import socket
+import socketserver
+import threading
+import http.server
+import ipaddress
+import urllib.parse
+import argparse
+import sys
+
+class BaseHandler(object):
+    hostname = socket.gethostname()
+
+    def logRequest(self):
+        print(self.server.socket.getsockname())
+
+    def getResponse(self):
+        # print("{} ({})".format(
+        #     #self.server.socket.getpeername(),
+        #     self.server.socket.getsockname()
+        # ))
+        return bytes(
+            '{0}: {1} {2}:{3}->{4}:{5}\n'.format(
+                self._proto,
+                self.hostname,
+                *self.client_address,
+                *self.server.socket.getsockname()
+            ),
+            encoding='utf8')
+
+class UDPHandler(BaseHandler, socketserver.DatagramRequestHandler):
+
+    _proto = 'UDP'
+
+    def handle(self):
+        data = self.request[0].strip()
+        socket = self.request[1]
+        # self.logRequest()
+        socket.sendto(self.getResponse(), self.client_address)
+        # Send a close to the client
+        self.finish()
+
+class TCPHandler(BaseHandler,socketserver.StreamRequestHandler):
+    _proto = 'TCP'
+    def handle(self):
+        self.data = self.rfile.readline().strip()
+        self.wfile.write(self.getResponse())
+        self.wfile.close()
+
+class HTTPHandler(BaseHandler, http.server.BaseHTTPRequestHandler):
+    _proto = 'HTTP'
+
+    def do_GET(self):
+
+        res_hdr = {
+            'Content-type': 'text/plain',
+            'Connection': 'Close',
+        }
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
+        # Allways respond 200
+        self.send_response(200)
+        for h in res_hdr:
+            self.send_header(h, res_hdr[h])
+        self.end_headers()
+
+        # Verbose mode
+        if 'f' in query:
+            # Show request
+            self.wfile.write(bytes('{0}\n'.format(
+                self.requestline,
+            ), encoding='utf8'))
+            for h in self.headers:
+                self.wfile.write(
+                    bytes('{0}: {1}\n'.format(h, self.headers[h]),
+                          encoding='utf8'))
+            self.wfile.write(bytes('\n', encoding='utf8'))
+
+            # Show response
+            self.wfile.write(bytes('{0} {1} OK\n'.format(
+                self.request_version,
+                200,
+            ), encoding='utf8'))
+            for h in res_hdr:
+                self.wfile.write(
+                    bytes('{0}: {1}\n'.format(h, res_hdr[h]),
+                          encoding='utf8'))
+            self.wfile.write(bytes('\n', encoding='utf8'))
+
+        #Send the response
+        self.wfile.write(self.getResponse())
+
+    # Do no log request
+    def log_request(code, size):
+        pass
+
+
+
+class BaseServer(object):
+    __slots__ = ('protocol', 'address', 'port', 'interface')
+    def __init__(self, bind):
+        # Check if protocol is provided and has a valid value
+        match = bind.split('@')
+        self.protocol = 'tcp'
+        if len(match) > 1:
+            assert match[0] in ['udp', 'tcp', 'http']
+            self.protocol = match[0]
+            bind=match[1]
+
+        # Split remaining based on latest ':'
+        ip, sep, port = bind.rpartition(':')
+        assert sep
+
+        self.port=int(port)
+        self.address=ip
+        self.interface=None
+        # Check if interface restriction is used
+        match = ip.split('%')
+        if len(match) > 1:
+            self.address=match[0]
+            self.interface=match[1]
+
+    def get_bind(self):
+        return (self.address, self.port)
+
+
+    def bind(self):
+        self.allow_reuse_address = 1
+        # https://djangocas.dev/blog/linux/linux-SO_BINDTODEVICE-and-mac-IP_BOUND_IF-to-bind-socket-to-a-network-interface/
+        if self.interface is not None:
+            # Linux
+            _opts = None
+            if sys.platform == 'linux':
+                _opts = (
+                    socket.SOL_SOCKET,
+                    socket.SO_BINDTODEVICE,
+                    bytes(self.interface + '\0',encoding='utf8'))
+            else:
+                _opts = (
+                    socket.IPPROTO_IP,
+                    25,
+                    socket.if_nametoindex(self.interface))
+            self.socket.setsockopt(*_opts)
+        self.server_bind()
+        self.server_activate()
+
+
+class UDPServer(BaseServer, socketserver.ThreadingUDPServer):
+
+    def __init__(self,  *args, **kwargs):
+        BaseServer.__init__(self, *args, **kwargs)
+        socketserver.ThreadingUDPServer.__init__(self, self.get_bind(),
+                                                 UDPHandler,
+                                                 bind_and_activate=False)
+        self.bind()
+
+class TCPServer(BaseServer, socketserver.ThreadingTCPServer):
+
+    def __init__(self,  *args, **kwargs):
+        BaseServer.__init__(self, *args, **kwargs)
+        socketserver.ThreadingTCPServer.__init__(self, self.get_bind(),
+                                                 TCPHandler,
+                                                 bind_and_activate=False)
+        self.bind()
+
+
+class HTTPServer(BaseServer, http.server.ThreadingHTTPServer):
+
+    def __init__(self,  *args, **kwargs):
+        BaseServer.__init__(self, *args, **kwargs)
+        http.server.HTTPServer.__init__(self, self.get_bind(),
+                                        HTTPHandler,
+                                        bind_and_activate=False)
+        self.bind()
+
+
+def start(binds):
+    threads = []
+    for bind in binds:
+        if bind.startswith('udp@'):
+            s = UDPServer(bind)
+        elif bind.startswith('tcp@'):
+            s = TCPServer(bind)
+        elif bind.startswith('http@'):
+            s = HTTPServer(bind)
+        else:
+            continue
+        t = threading.Thread(target=s.serve_forever)
+        t.start()
+        threads.append(t)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='''Small UDP/TCP/HTTP responder. It can be used as a simple server for proxies.
+        '''
+    )
+    parser.add_argument('-L',
+                        help='Add listen. Format: (udp|tcp|http)@IP[%%IFACE]:PORT',
+                        action='append')
+    args = parser.parse_args(sys.argv[1:])
+    return vars(args)
+
+
+def main():
+    args = parse_args()
+    if args['L'] is None:
+        args['L'] = default=['udp@0.0.0.0:5555',
+                            'tcp@0.0.0.0:5555',
+                            'http@0.0.0.0:5556']
+    start(args['L'])
+
+main()
